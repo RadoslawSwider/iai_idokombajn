@@ -13,6 +13,11 @@ from logic.pinner import run_pinner
 from logic.filter_csv import run_filter
 from logic.description_downloader import run_description_downloader
 from gui.translator_dialog import TranslatorDialog
+from gui.description_generator_dialog import DescriptionGeneratorDialog
+from logic.update_descriptions import run_update_descriptions
+from logic.copy_menu_nodes import run_copy_menu_nodes
+from logic.update_priorities import run_update_priorities
+from gui.new_modules_dialog import NewModulesDialog
 
 # --- Wątek roboczy do operacji w tle ---
 class Worker(QThread):
@@ -121,6 +126,7 @@ class MainWindow(QMainWindow):
         super().__init__()
         self.setWindowTitle("IdoKombajn")
         self.setGeometry(100, 100, 900, 700)
+        self.description_dialog = None
         self.initUI()
 
     def initUI(self):
@@ -146,31 +152,135 @@ class MainWindow(QMainWindow):
         left_column_layout.addWidget(QLabel("<b>CROSSBORDER - MENU</b>"))
 
         self.buttons = []
-        btn_downloader = QPushButton("1. Pobierz informacje o elementach menu")
-        btn_downloader.setToolTip("Pobiera pełną listę produktów...")
+
+        # Helper function to create button with info icon
+        def create_button_with_info(text, tooltip_text):
+            layout = QHBoxLayout()
+            button = QPushButton(text)
+            self.buttons.append(button)
+            
+            info_label = QLabel("ⓘ")
+            info_label.setToolTip(tooltip_text)
+            
+            layout.addWidget(button)
+            layout.addWidget(info_label)
+            layout.setStretch(0, 1) # Make button expand
+            
+            return button, layout
+
+        # 1. Downloader
+        downloader_tooltip = '''<h3>Moduł: Pobierz informacje o elementach menu</h3>
+<p><b>Cel:</b> Pobranie z IdoSell pełnej listy wszystkich produktów i ich przypisań do menu w każdym ze sklepów.</p>
+<b>Kroki:</b>
+<ol>
+    <li>Nawiązuje połączenie z API IdoSell przy użyciu Twojego Base URL i klucza API.</li>
+    <li>Pobiera dane z endpointu <i>/product-menus</i>, strona po stronie, aby obsłużyć duże ilości danych.</li>
+    <li>Zapisuje wszystkie znalezione przypisania do jednego pliku <b>produkty_menu_final.csv</b>.</li>
+</ol>
+<p><b>Wynik:</b> Plik CSV zawierający kluczowe informacje: <b>productId</b> (ID towaru), <b>shopId</b> (ID sklepu), <b>menuId</b> (ID menu) oraz <b>menuItemTextId</b> (węzły nawigacji). Ten plik jest podstawą dla modułów Filtruj, Odepnij i Przypnij.</p>'''
+        btn_downloader, downloader_layout = create_button_with_info("Pobierz informacje o elementach menu", downloader_tooltip)
         btn_downloader.clicked.connect(self.run_downloader_task)
-        self.buttons.append(btn_downloader)
-        left_column_layout.addWidget(btn_downloader)
+        left_column_layout.addLayout(downloader_layout)
 
-        btn_filter = QPushButton("2. Filtruj plik CSV")
-        btn_filter.setToolTip("Filtruje plik 'produkty_menu_final.csv'...")
+        # 2. Filter
+        filter_tooltip = '''<h3>Moduł: Filtruj plik CSV</h3>
+<p><b>Cel:</b> Wyizolowanie z głównego pliku `produkty_menu_final.csv` danych dotyczących tylko jednego, konkretnego sklepu.</p>
+<b>Kroki:</b>
+<ol>
+    <li>Otwiera okno dialogowe, w którym podajesz <b>Shop ID</b> sklepu, który chcesz zostawić.</li>
+    <li>Wczytuje plik `produkty_menu_final.csv`.</li>
+    <li>Filtruje wiersze, pozostawiając tylko te, gdzie wartość w kolumnie <i>shop_id</i> zgadza się z podanym przez Ciebie ID.</li>
+    <li>Zapisuje wynik do nowego pliku <b>produkty_menu_final_filtered.csv</b>.</li>
+</ol>
+<p><b>Wynik:</b> Nowy, przefiltrowany plik CSV, gotowy do dalszej pracy, np. z modułem "Przypnij towary".</p>'''
+        btn_filter, filter_layout = create_button_with_info("Filtruj plik CSV", filter_tooltip)
         btn_filter.clicked.connect(self.run_filter_task)
-        self.buttons.append(btn_filter)
-        left_column_layout.addWidget(btn_filter)
+        left_column_layout.addLayout(filter_layout)
 
-        btn_unpinner = QPushButton("3. Odepnij towary od Menu")
-        btn_unpinner.setToolTip("Masowo usuwa powiązania produktów...")
+        # 3. Unpinner
+        unpinner_tooltip = '''<h3>Moduł: Odepnij towary od Menu</h3>
+<p><b>Cel:</b> Masowe usunięcie wszystkich produktów z wybranego menu w danym sklepie.</p>
+<p><b>Uwaga:</b> Działa na podstawie pliku `produkty_menu_final.csv`, więc upewnij się, że jest on aktualny.</p>
+<b>Kroki:</b>
+<ol>
+    <li>Otwiera okno dialogowe, w którym podajesz <b>Shop ID</b> oraz <b>Menu ID</b>.</li>
+    <li>Na podstawie tych danych, moduł wyszukuje w pliku `produkty_menu_final.csv` wszystkie produkty przypisane do tego konkretnego menu.</li>
+    <li>Dla każdego znalezionego produktu, wysyła do API IdoSell żądanie <b>DELETE</b>, które usuwa powiązanie produktu z menu.</li>
+    <li>W logach na bieżąco raportuje, który produkt został pomyślnie odpięty lub przy którym wystąpił błąd.</li>
+</ol>
+<p><b>Wynik:</b> Produkty w IdoSell nie są już przypisane do podanego menu.</p>'''
+        btn_unpinner, unpinner_layout = create_button_with_info("Odepnij towary od Menu", unpinner_tooltip)
         btn_unpinner.clicked.connect(self.run_unpinner_task)
-        self.buttons.append(btn_unpinner)
-        left_column_layout.addWidget(btn_unpinner)
+        left_column_layout.addLayout(unpinner_layout)
 
-        btn_pinner = QPushButton("4. Przypnij towary do Menu")
-        btn_pinner.setToolTip("Masowo przypisuje produkty...")
+        # 4. Pinner
+        pinner_tooltip = '''<h3>Moduł: Przypnij towary do Menu</h3>
+<p><b>Cel:</b> Masowe przypisanie listy produktów z pliku CSV do konkretnego menu w IdoSell.</p>
+<b>Kroki:</b>
+<ol>
+    <li>Otwiera okno dialogowe, w którym podajesz <b>Shop ID</b>, <b>Menu ID</b> oraz wskazujesz <b>plik CSV</b> z listą produktów do przypięcia.</li>
+    <li>Plik CSV musi zawierać kolumnę z identyfikatorami produktów (domyślnie `product_id`).</li>
+    <li>Moduł wczytuje wskazany plik CSV.</li>
+    <li>Dla każdego ID produktu z pliku, wysyła do API IdoSell żądanie <b>POST</b>, które tworzy powiązanie produktu z podanym menu w danym sklepie.</li>
+    <li>W logach na bieżąco raportuje, który produkt został pomyślnie przypięty lub przy którym wystąpił błąd.</li>
+</ol>
+<p><b>Wynik:</b> Produkty z pliku CSV są przypisane do docelowego menu w IdoSell.</p>'''
+        btn_pinner, pinner_layout = create_button_with_info("Przypnij towary do Menu", pinner_tooltip)
         btn_pinner.clicked.connect(self.run_pinner_task)
-        self.buttons.append(btn_pinner)
-        left_column_layout.addWidget(btn_pinner)
-        left_column_layout.addStretch()
+        left_column_layout.addLayout(pinner_layout)
 
+        # Separator for new modules
+        line_menu = QFrame()
+        line_menu.setFrameShape(QFrame.Shape.HLine)
+        line_menu.setFrameShadow(QFrame.Shadow.Sunken)
+        left_column_layout.addWidget(line_menu)
+
+        # 5. Copy Menu Nodes
+        copy_nodes_tooltip = '''<h3>Moduł: Kopiuj strukturę menu (węzły)</h3>
+<p><b>Cel:</b> Zreplikowanie całej struktury kategorii (węzłów) z jednego menu do drugiego, bez przypisywania produktów.</p>
+<b>Kroki:</b>
+<ol>
+    <li>Otwiera okno, gdzie podajesz ID sklepu i menu (źródłowe i docelowe) oraz język.</li>
+    <li>Pobiera strukturę menu ze źródła.</li>
+    <li>Tworzy tę samą strukturę w menu docelowym, wysyłając dane w paczkach po 100 elementów, aby zminimalizować liczbę zapytań API.</li>
+</ol>
+<p><b>Wynik:</b> W docelowym menu powstaje taka sama hierarchia kategorii jak w menu źródłowym.</p>'''
+        btn_copy_nodes, copy_nodes_layout = create_button_with_info("Kopiuj strukturę menu (węzły)", copy_nodes_tooltip)
+        btn_copy_nodes.clicked.connect(self.run_copy_menu_nodes_task)
+        left_column_layout.addLayout(copy_nodes_layout)
+
+        # 6. Update Priorities
+        update_priorities_tooltip = '''<h3>Moduł: Synchronizuj priorytety węzłów</h3>
+<p><b>Cel:</b> Ustawienie w menu docelowym takiej samej kolejności (priorytetów) węzłów, jaka jest w menu źródłowym.</p>
+<b>Kroki:</b>
+<ol>
+    <li>Otwiera okno, gdzie podajesz dane sklepów i menu (źródło i cel) oraz język aktualizacji.</li>
+    <li>Porównuje elementy menu na podstawie ich <b>nazw</b> w języku polskim.</li>
+    <li>Jeśli priorytet dla elementu o tej samej nazwie różni się, przygotowuje aktualizację dla docelowego języka.</li>
+    <li>Wysyła zmiany do API w paczkach po 100.</li>
+</ol>
+<p><b>Wynik:</b> Węzły w menu docelowym mają tę samą kolejność co w źródłowym.</p>'''
+        btn_update_priorities, update_priorities_layout = create_button_with_info("Synchronizuj priorytety węzłów", update_priorities_tooltip)
+        btn_update_priorities.clicked.connect(self.run_update_priorities_task)
+        left_column_layout.addLayout(update_priorities_layout)
+
+        # 7. Update Descriptions
+        update_descriptions_tooltip = '''<h3>Moduł: Synchronizuj opisy góra/dół</h3>
+<p><b>Cel:</b> Przeniesienie opisów górnego i dolnego z węzłów menu źródłowego do docelowego.</p>
+<b>Kroki:</b>
+<ol>
+    <li>Otwiera okno, gdzie podajesz dane sklepów i menu (źródło i cel) oraz język aktualizacji.</li>
+    <li>Porównuje elementy menu na podstawie ich <b>nazw</b> w języku polskim.</li>
+    <li>Jeśli opisy dla elementu o tej samej nazwie różnią się, przygotowuje aktualizację dla docelowego języka.</li>
+    <li>Wysyła zmiany do API w paczkach po 100.</li>
+</ol>
+<p><b>Wynik:</b> Węzły w menu docelowym mają te same opisy co w źródłowym.</p>'''
+        btn_update_descriptions, update_descriptions_layout = create_button_with_info("Synchronizuj opisy góra/dół", update_descriptions_tooltip)
+        btn_update_descriptions.clicked.connect(self.run_update_descriptions_task)
+        left_column_layout.addLayout(update_descriptions_layout)
+
+        
+        left_column_layout.addStretch()
         columns_layout.addWidget(left_widget)
 
         line = QFrame()
@@ -184,17 +294,64 @@ class MainWindow(QMainWindow):
 
         right_column_layout.addWidget(QLabel("<b>POZOSTAŁE</b>"))
 
-        btn_desc_downloader = QPushButton("Pobierz nazwy i opisy produktów")
-        btn_desc_downloader.setToolTip("Pobiera pełne dane o wszystkich produktach...")
+        # 5. Description Downloader
+        desc_downloader_tooltip = '''<h3>Moduł: Pobierz nazwy i opisy produktów</h3>
+<p><b>Cel:</b> Pobranie z IdoSell nazw oraz długich opisów dla wszystkich produktów we wszystkich dostępnych językach.</p>
+<b>Kroki:</b>
+<ol>
+    <li>Nawiązuje połączenie z API IdoSell.</li>
+    <li>Pobiera dane z endpointu <i>/products</i>, strona po stronie. Prosi API o zwrócenie pól z tłumaczeniami (nazwy, opisy) dla wszystkich języków.</li>
+    <li>Zapisuje wyniki do pliku <b>produkty.csv</b>.</li>
+</ol>
+<p><b>Wynik:</b> Plik CSV z kolumnami dla każdego języka, np. `product_id`, `name_pol`, `description_pol`, `name_eng`, `description_eng`, itd. Ten plik jest idealną bazą dla modułów "Tłumacz Google" oraz "Generator Opisów AI".</p>'''
+        btn_desc_downloader, desc_downloader_layout = create_button_with_info("Pobierz nazwy i opisy produktów", desc_downloader_tooltip)
         btn_desc_downloader.clicked.connect(self.run_description_downloader_task)
-        self.buttons.append(btn_desc_downloader)
-        right_column_layout.addWidget(btn_desc_downloader)
+        right_column_layout.addLayout(desc_downloader_layout)
 
-        btn_translator = QPushButton("Tłumacz Google")
-        btn_translator.setToolTip("Otwiera zaawansowany translator plików CSV z obsługą HTML.")
+        # 6. Translator
+        translator_tooltip = '''<h3>Moduł: Tłumacz Google</h3>
+<p><b>Cel:</b> Zaawansowane tłumaczenie danych w plikach CSV, z inteligentną obsługą kodu HTML.</p>
+<b>Kroki:</b>
+<ol>
+    <li><b>Wybór i Ustawienia:</b> Otwierasz dedykowane okno, gdzie wybierasz plik CSV, języki, kolumny do tłumaczenia oraz parametry techniczne (liczba wątków, zapytania/sek).</li>
+    <li><b>Inteligentna Ekstrakcja Tekstu:</b>
+        <ul>
+            <li>Skrypt analizuje każdą komórkę i <b>rozpoznaje kod HTML</b>.</li>
+            <li>Wyciąga do tłumaczenia <u>tylko tekst widoczny dla użytkownika</u>, pozostawiając tagi HTML nienaruszone.</li>
+            <li>Zawartość tagów &lt;style&gt; i &lt;script&gt; jest celowo pomijana, aby nie zniszczyć wyglądu.</li>
+        </ul>
+    </li>
+    <li><b>Tłumaczenie Równoległe:</b>
+        <ul>
+            <li>Zebrane teksty są wysyłane do Google Translate w wielu wątkach jednocześnie, co znacznie przyspiesza pracę.</li>
+            <li>Wbudowany "hamulec" chroni przed zablokowaniem przez Google. W razie bana, skrypt automatycznie czeka i wznawia pracę.</li>
+        </ul>
+    </li>
+    <li><b>Składanie i Zapis:</b> Przetłumaczone fragmenty są wstawiane z powrotem w ich oryginalne miejsca w strukturze HTML. Wynik jest zapisywany do nowego pliku z końcówką <b>_translated.csv</b>.</li>
+</ol>'''
+        btn_translator, translator_layout = create_button_with_info("Tłumacz Google", translator_tooltip)
         btn_translator.clicked.connect(self.run_translator_dialog)
-        self.buttons.append(btn_translator)
-        right_column_layout.addWidget(btn_translator)
+        right_column_layout.addLayout(translator_layout)
+
+        # 7. AI Description Generator
+        desc_generator_tooltip = '''<h3>Moduł: Generator Opisów AI</h3>
+<p><b>Cel:</b> Tworzenie unikalnych, marketingowych opisów produktów przy użyciu sztucznej inteligencji (OpenAI).</p>
+<b>Kroki:</b>
+<ol>
+    <li><b>Konfiguracja:</b> W dedykowanym oknie podajesz klucz API OpenAI, wybierasz plik CSV z produktami, definiujesz nazwy kolumn (ID i opis) oraz dostosowujesz prompt dla AI i opcje formatowania (ramka HTML).</li>
+    <li><b>Etap 1: Ekstrakcja Cech (AI):</b> Skrypt czyści opis produktu z HTML i wysyła go do modelu <b>gpt-3.5-turbo</b> w celu wyodrębnienia kluczowych cech produktu.</li>
+    <li><b>Etap 2: Tworzenie Treści (AI):</b> Wyodrębnione cechy są wstawiane do Twojego promptu i wysyłane do modelu <b>gpt-4o</b>, który generuje w formacie JSON nową nazwę, zajawkę, opis główny i listę zalet.</li>
+    <li><b>Formatowanie i Zapis:</b>
+        <ul>
+            <li>Skrypt formatuje otrzymane dane jako estetyczny blok HTML (z wybranym kolorem) lub jako zwykły tekst.</li>
+            <li>Wynik jest na bieżąco zapisywany do pliku z końcówką <b>_wygenerowane.csv</b>, co chroni postęp pracy.</li>
+        </ul>
+    </li>
+</ol>
+<p><b>Wynik:</b> Plik CSV z nowymi, gotowymi do użycia nazwami i opisami produktów.</p>'''
+        btn_desc_generator, desc_generator_layout = create_button_with_info("Generator Opisów AI", desc_generator_tooltip)
+        btn_desc_generator.clicked.connect(self.run_description_generator_dialog)
+        right_column_layout.addLayout(desc_generator_layout)
 
         right_column_layout.addStretch()
         columns_layout.addWidget(right_widget)
@@ -231,6 +388,12 @@ class MainWindow(QMainWindow):
     def run_translator_dialog(self):
         dialog = TranslatorDialog(self)
         dialog.exec()
+
+    def run_description_generator_dialog(self):
+        if not self.description_dialog:
+            self.description_dialog = DescriptionGeneratorDialog(self)
+        self.description_dialog.show()
+        self.description_dialog.activateWindow()
 
     def _start_task(self, func, *args, **kwargs):
         base_url = self.base_url_input.text()
@@ -290,6 +453,43 @@ class MainWindow(QMainWindow):
                 return
             self._start_task(run_pinner, shop_id=int(shop_id), menu_id=int(menu_id), csv_filename=csv_path)
 
+    def run_copy_menu_nodes_task(self):
+        dialog = NewModulesDialog("Kopiuj strukturę menu (węzły)", self)
+        if dialog.exec():
+            source_shop_id, source_menu_id, dest_shop_id, dest_menu_id, dest_lang_id = dialog.get_data()
+            if not (source_shop_id.isdigit() and source_menu_id.isdigit() and dest_shop_id.isdigit() and dest_menu_id.isdigit()):
+                self.log("BŁĄD: Wszystkie ID muszą być liczbami.")
+                return
+            if not dest_lang_id:
+                self.log("BŁĄD: Musisz podać język.")
+                return
+            self._start_task(run_copy_menu_nodes, source_shop_id=int(source_shop_id), source_menu_id=int(source_menu_id), dest_shop_id=int(dest_shop_id), dest_menu_id=int(dest_menu_id), lang_id=dest_lang_id)
+
+    def run_update_priorities_task(self):
+        dialog = NewModulesDialog("Synchronizuj priorytety węzłów", self)
+        if dialog.exec():
+            source_shop_id, source_menu_id, dest_shop_id, dest_menu_id, dest_lang_id = dialog.get_data()
+            if not (source_shop_id.isdigit() and source_menu_id.isdigit() and dest_shop_id.isdigit() and dest_menu_id.isdigit()):
+                self.log("BŁĄD: Wszystkie ID muszą być liczbami.")
+                return
+            if not dest_lang_id:
+                self.log("BŁĄD: Musisz podać język.")
+                return
+            self._start_task(run_update_priorities, source_shop_id=source_shop_id, source_menu_id=source_menu_id, dest_shop_id=dest_shop_id, dest_menu_id=dest_menu_id, dest_lang_id=dest_lang_id)
+
+    def run_update_descriptions_task(self):
+        dialog = NewModulesDialog("Synchronizuj opisy góra/dół", self)
+        if dialog.exec():
+            source_shop_id, source_menu_id, dest_shop_id, dest_menu_id, dest_lang_id = dialog.get_data()
+            if not (source_shop_id.isdigit() and source_menu_id.isdigit() and dest_shop_id.isdigit() and dest_menu_id.isdigit()):
+                self.log("BŁĄD: Wszystkie ID muszą być liczbami.")
+                return
+            if not dest_lang_id:
+                self.log("BŁĄD: Musisz podać język.")
+                return
+            self._start_task(run_update_descriptions, source_shop_id=source_shop_id, source_menu_id=source_menu_id, dest_shop_id=dest_shop_id, dest_menu_id=dest_menu_id, dest_lang_id=dest_lang_id)
+
+
     def task_finished(self):
         self.log("--- Zadanie zakończone ---\n")
         self.set_buttons_enabled(True)
@@ -312,8 +512,9 @@ if __name__ == "__main__":
             background-color: #3C3F41;
             color: #F0F0F0;
             border: 1px solid #555555;
-            padding: 5px;
-            min-height: 20px;
+            padding: 4px;
+            min-height: 18px;
+            font-size: 11px;
         }
         QPushButton:hover {
             background-color: #4A90E2;
