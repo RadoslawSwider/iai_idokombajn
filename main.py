@@ -2,7 +2,7 @@ import sys
 from PyQt6.QtWidgets import (
     QApplication, QMainWindow, QWidget, QVBoxLayout, QHBoxLayout, 
     QPushButton, QLineEdit, QLabel, QTextEdit, QDialog, QFormLayout, 
-    QDialogButtonBox, QFileDialog, QFrame
+    QDialogButtonBox, QFileDialog, QFrame, QSpinBox
 )
 from PyQt6.QtCore import QThread, pyqtSignal
 
@@ -14,6 +14,7 @@ from logic.filter_csv import run_filter
 from logic.description_downloader import run_description_downloader
 from gui.translator_dialog import TranslatorDialog
 from gui.description_generator_dialog import DescriptionGeneratorDialog
+from gui.attribute_translator_dialog import AttributeTranslatorDialog
 from logic.update_descriptions import run_update_descriptions
 from logic.copy_menu_nodes import run_copy_menu_nodes
 from logic.update_priorities import run_update_priorities
@@ -72,6 +73,10 @@ class PinnerDialog(QDialog):
         self.csv_path_input = QLineEdit(self)
         self.csv_browse_button = QPushButton("Przeglądaj...")
         self.csv_browse_button.clicked.connect(self.browse_csv)
+        self.num_workers_input = QSpinBox(self)
+        self.num_workers_input.setValue(4)
+        self.num_workers_input.setMinimum(1)
+        self.num_workers_input.setMaximum(16)
 
         form_layout = QFormLayout()
         form_layout.addRow("Shop ID:", self.shop_id_input)
@@ -81,6 +86,7 @@ class PinnerDialog(QDialog):
         csv_layout.addWidget(self.csv_path_input)
         csv_layout.addWidget(self.csv_browse_button)
         form_layout.addRow("Plik CSV:", csv_layout)
+        form_layout.addRow("Liczba workerów:", self.num_workers_input)
 
         button_box = QDialogButtonBox(QDialogButtonBox.StandardButton.Ok | QDialogButtonBox.StandardButton.Cancel)
         button_box.accepted.connect(self.accept)
@@ -97,7 +103,7 @@ class PinnerDialog(QDialog):
             self.csv_path_input.setText(filename)
 
     def get_data(self):
-        return self.shop_id_input.text(), self.menu_id_input.text(), self.csv_path_input.text()
+        return self.shop_id_input.text(), self.menu_id_input.text(), self.csv_path_input.text(), self.num_workers_input.value()
 
 class FilterDialog(QDialog):
     def __init__(self, parent=None):
@@ -353,6 +359,25 @@ class MainWindow(QMainWindow):
         btn_desc_generator.clicked.connect(self.run_description_generator_dialog)
         right_column_layout.addLayout(desc_generator_layout)
 
+        # 8. Attribute Translator
+        attr_translator_tooltip = """<h3>Moduł: Tłumacz Atrybutów ALT/TITLE</h3>
+<p><b>Cel:</b> Tłumaczenie atrybutów 'alt' i 'title' w tagach HTML w wybranej kolumnie pliku CSV.</p>
+<b>Kroki:</b>
+<ol>
+    <li><b>Wybór i Ustawienia:</b> Otwierasz dedykowane okno, gdzie wybierasz plik CSV, kolumnę z ID, kolumnę z opisem HTML, język docelowy i liczbę wątków.</li>
+    <li><b>Ekstrakcja i Tłumaczenie:</b>
+        <ul>
+            <li>Skrypt analizuje każdą komórkę w wybranej kolumnie.</li>
+            <li>Używa BeautifulSoup do znalezienia wszystkich tagów z atrybutami 'alt' i 'title'.</li>
+            <li>Tłumaczy wartości tych atrybutów na wybrany język.</li>
+        </ul>
+    </li>
+    <li><b>Zapis:</b> Wynik jest zapisywany do nowego pliku z końcówką <b>_generated.csv</b>. Dodawana jest nowa kolumna z przetłumaczoną treścią oraz kolumna z błędami, jeśli wystąpiły.</li>
+</ol>"""
+        btn_attr_translator, attr_translator_layout = create_button_with_info("Tłumacz Atrybutów ALT/TITLE", attr_translator_tooltip)
+        btn_attr_translator.clicked.connect(self.run_attribute_translator_dialog)
+        right_column_layout.addLayout(attr_translator_layout)
+
         right_column_layout.addStretch()
         columns_layout.addWidget(right_widget)
         
@@ -394,6 +419,10 @@ class MainWindow(QMainWindow):
             self.description_dialog = DescriptionGeneratorDialog(self)
         self.description_dialog.show()
         self.description_dialog.activateWindow()
+
+    def run_attribute_translator_dialog(self):
+        dialog = AttributeTranslatorDialog(self)
+        dialog.exec()
 
     def _start_task(self, func, *args, **kwargs):
         base_url = self.base_url_input.text()
@@ -444,14 +473,14 @@ class MainWindow(QMainWindow):
     def run_pinner_task(self):
         dialog = PinnerDialog(self)
         if dialog.exec():
-            shop_id, menu_id, csv_path = dialog.get_data()
+            shop_id, menu_id, csv_path, num_workers = dialog.get_data()
             if not (shop_id.isdigit() and menu_id.isdigit()):
                 self.log("BŁĄD: Shop ID i Menu ID muszą być liczbami.")
                 return
             if not csv_path:
                 self.log("BŁĄD: Musisz wybrać plik CSV.")
                 return
-            self._start_task(run_pinner, shop_id=int(shop_id), menu_id=int(menu_id), csv_filename=csv_path)
+            self._start_task(run_pinner, shop_id=int(shop_id), menu_id=int(menu_id), csv_filename=csv_path, num_workers=num_workers)
 
     def run_copy_menu_nodes_task(self):
         dialog = NewModulesDialog("Kopiuj strukturę menu (węzły)", self)
