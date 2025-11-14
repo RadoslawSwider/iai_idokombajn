@@ -15,10 +15,12 @@ from logic.description_downloader import run_description_downloader
 from gui.translator_dialog import TranslatorDialog
 from gui.description_generator_dialog import DescriptionGeneratorDialog
 from gui.attribute_translator_dialog import AttributeTranslatorDialog
+from gui.description_updater_dialog import DescriptionUpdaterDialog
 from logic.update_descriptions import run_update_descriptions
 from logic.copy_menu_nodes import run_copy_menu_nodes
 from logic.update_priorities import run_update_priorities
 from gui.new_modules_dialog import NewModulesDialog
+from logic.id_based_downloader import run_id_based_downloader
 
 # --- Wątek roboczy do operacji w tle ---
 class Worker(QThread):
@@ -33,10 +35,18 @@ class Worker(QThread):
 
     def run(self):
         try:
-            for message in self.func(*self.args, **self.kwargs):
-                self.progress.emit(message)
+            # Check if the function is a generator, if so, iterate through it
+            import inspect
+            if inspect.isgeneratorfunction(self.func) or inspect.isgenerator(self.func):
+                for message in self.func(*self.args, **self.kwargs):
+                    self.progress.emit(message)
+            else: # Otherwise, assume it's a regular function that might not yield progress
+                result = self.func(*self.args, **self.kwargs)
+                if result: # If it returns something, log it
+                    self.progress.emit(str(result))
         except Exception as e:
-            self.progress.emit(f"Wystąpił krytyczny błąd w wątku: {e}")
+            import traceback
+            self.progress.emit(f"Wystąpił krytyczny błąd w wątku: {e}\n{traceback.format_exc()}")
         finally:
             self.finished.emit()
 
@@ -64,6 +74,35 @@ class UnpinnerDialog(QDialog):
     def get_data(self):
         return self.shop_id_input.text(), self.menu_id_input.text()
 
+class IdBasedDownloaderDialog(QDialog):
+    def __init__(self, parent=None):
+        super().__init__(parent)
+        self.setWindowTitle("Pobierz dane po ID - Wybierz plik")
+        self.csv_path_input = QLineEdit(self)
+        self.csv_browse_button = QPushButton("Przeglądaj...")
+        self.csv_browse_button.clicked.connect(self.browse_csv)
+
+        layout = QVBoxLayout()
+        csv_layout = QHBoxLayout()
+        csv_layout.addWidget(QLabel("Plik CSV z ID:"))
+        csv_layout.addWidget(self.csv_path_input)
+        csv_layout.addWidget(self.csv_browse_button)
+        layout.addLayout(csv_layout)
+
+        button_box = QDialogButtonBox(QDialogButtonBox.StandardButton.Ok | QDialogButtonBox.StandardButton.Cancel)
+        button_box.accepted.connect(self.accept)
+        button_box.rejected.connect(self.reject)
+        layout.addWidget(button_box)
+        self.setLayout(layout)
+
+    def browse_csv(self):
+        filename, _ = QFileDialog.getOpenFileName(self, "Wybierz plik CSV z listą ID", "", "CSV Files (*.csv)")
+        if filename:
+            self.csv_path_input.setText(filename)
+
+    def get_data(self):
+        return self.csv_path_input.text()
+
 class PinnerDialog(QDialog):
     def __init__(self, parent=None):
         super().__init__(parent)
@@ -73,10 +112,23 @@ class PinnerDialog(QDialog):
         self.csv_path_input = QLineEdit(self)
         self.csv_browse_button = QPushButton("Przeglądaj...")
         self.csv_browse_button.clicked.connect(self.browse_csv)
-        self.num_workers_input = QSpinBox(self)
-        self.num_workers_input.setValue(4)
-        self.num_workers_input.setMinimum(1)
-        self.num_workers_input.setMaximum(16)
+        self.timeout_input = QSpinBox(self)
+        self.timeout_input.setValue(120)
+        self.timeout_input.setMinimum(30)
+        self.timeout_input.setMaximum(600)
+        self.delay_input = QSpinBox(self)
+        self.delay_input.setValue(5)
+        self.delay_input.setMinimum(0)
+        self.delay_input.setMaximum(60)
+        self.long_pause_batch_count_input = QSpinBox(self)
+        self.long_pause_batch_count_input.setValue(100)
+        self.long_pause_batch_count_input.setMinimum(0)
+        self.long_pause_batch_count_input.setMaximum(1000)
+        self.long_pause_duration_input = QSpinBox(self)
+        self.long_pause_duration_input.setValue(5)
+        self.long_pause_duration_input.setMinimum(0)
+        self.long_pause_duration_input.setMaximum(60)
+
 
         form_layout = QFormLayout()
         form_layout.addRow("Shop ID:", self.shop_id_input)
@@ -86,7 +138,10 @@ class PinnerDialog(QDialog):
         csv_layout.addWidget(self.csv_path_input)
         csv_layout.addWidget(self.csv_browse_button)
         form_layout.addRow("Plik CSV:", csv_layout)
-        form_layout.addRow("Liczba workerów:", self.num_workers_input)
+        form_layout.addRow("Timeout (sekundy):", self.timeout_input)
+        form_layout.addRow("Opóźnienie po paczce (sekundy):", self.delay_input)
+        form_layout.addRow("Długa pauza po N paczkach:", self.long_pause_batch_count_input)
+        form_layout.addRow("Długa pauza (minuty):", self.long_pause_duration_input)
 
         button_box = QDialogButtonBox(QDialogButtonBox.StandardButton.Ok | QDialogButtonBox.StandardButton.Cancel)
         button_box.accepted.connect(self.accept)
@@ -103,7 +158,15 @@ class PinnerDialog(QDialog):
             self.csv_path_input.setText(filename)
 
     def get_data(self):
-        return self.shop_id_input.text(), self.menu_id_input.text(), self.csv_path_input.text(), self.num_workers_input.value()
+        return (
+            self.shop_id_input.text(), 
+            self.menu_id_input.text(), 
+            self.csv_path_input.text(), 
+            self.timeout_input.value(), 
+            self.delay_input.value(),
+            self.long_pause_batch_count_input.value(),
+            self.long_pause_duration_input.value()
+        )
 
 class FilterDialog(QDialog):
     def __init__(self, parent=None):
@@ -300,7 +363,7 @@ class MainWindow(QMainWindow):
 
         right_column_layout.addWidget(QLabel("<b>POZOSTAŁE</b>"))
 
-        # 5. Description Downloader
+        # Description Downloader
         desc_downloader_tooltip = '''<h3>Moduł: Pobierz nazwy i opisy produktów</h3>
 <p><b>Cel:</b> Pobranie z IdoSell nazw oraz długich opisów dla wszystkich produktów we wszystkich dostępnych językach.</p>
 <b>Kroki:</b>
@@ -314,7 +377,23 @@ class MainWindow(QMainWindow):
         btn_desc_downloader.clicked.connect(self.run_description_downloader_task)
         right_column_layout.addLayout(desc_downloader_layout)
 
-        # 6. Translator
+        # ID-Based Description Downloader
+        id_based_downloader_tooltip = '''<h3>Moduł: Pobierz nazwy i opisy produktów (na bazie ID)</h3>
+<p><b>Cel:</b> Szybkie pobranie nazw i opisów tylko dla wybranej listy produktów, podanej w pliku CSV.</p>
+<b>Kroki:</b>
+<ol>
+    <li>Wybierasz plik CSV zawierający kolumnę z identyfikatorami produktów (np. 'ID', '@id', 'product_id').</li>
+    <li>Skrypt pobiera z API wszystkie aktywne produkty w sklepie, używając wielu wątków dla maksymalnej prędkości.</li>
+    <li>Porównuje pobrane produkty z Twoją listą ID.</li>
+    <li>Dla każdego pasującego produktu, zapisuje jego ID, nazwę, krótki i długi opis (w języku polskim) do nowego pliku CSV z końcówką <b>_products.csv</b>.</li>
+    <li>Jeśli jakieś ID z Twojego pliku nie zostaną znalezione, ich lista zostanie zapisana do pliku tekstowego z końcówką <b>_missing.txt</b>.</li>
+</ol>
+<p><b>Wynik:</b> Dwa pliki - jeden z danymi znalezionych produktów, drugi z listą brakujących ID.</p>'''
+        btn_id_based_downloader, id_based_downloader_layout = create_button_with_info("Pobierz nazwy i opisy produktów (na bazie ID)", id_based_downloader_tooltip)
+        btn_id_based_downloader.clicked.connect(self.run_id_based_downloader_task)
+        right_column_layout.addLayout(id_based_downloader_layout)
+
+        # Translator
         translator_tooltip = '''<h3>Moduł: Tłumacz Google</h3>
 <p><b>Cel:</b> Zaawansowane tłumaczenie danych w plikach CSV, z inteligentną obsługą kodu HTML.</p>
 <b>Kroki:</b>
@@ -339,7 +418,21 @@ class MainWindow(QMainWindow):
         btn_translator.clicked.connect(self.run_translator_dialog)
         right_column_layout.addLayout(translator_layout)
 
-        # 7. AI Description Generator
+        # DescriptionUpdater
+        desc_updater_tooltip = '''<h3>Moduł: Aktualizuj Nazwy i Opisy</h3>
+<p><b>Cel:</b> Wysłanie przetłumaczonych lub wygenerowanych nazw i opisów produktów do IdoSell przez API.</p>
+<b>Kroki:</b>
+<ol>
+    <li><b>Konfiguracja:</b> W dedykowanym oknie podajesz klucz API, ID sklepu, język, a następnie wczytujesz plik CSV.</li>
+    <li><b>Mapowanie:</b> Wybierasz, która kolumna z pliku CSV odpowiada za ID produktu, nową nazwę i nowy opis.</li>
+    <li><b>Wysyłka:</b> Skrypt wysyła dane do API w paczkach (batches), aby zminimalizować liczbę zapytań i przyspieszyć proces.</li>
+</ol>
+<p><b>Wynik:</b> Nazwy i opisy produktów w Twoim sklepie IdoSell zostają zaktualizowane na podstawie danych z pliku CSV.</p>'''
+        btn_desc_updater, desc_updater_layout = create_button_with_info("Aktualizuj Nazwy i Opisy", desc_updater_tooltip)
+        btn_desc_updater.clicked.connect(self.open_description_updater_dialog)
+        right_column_layout.addLayout(desc_updater_layout)
+
+        # AI Description Generator
         desc_generator_tooltip = '''<h3>Moduł: Generator Opisów AI</h3>
 <p><b>Cel:</b> Tworzenie unikalnych, marketingowych opisów produktów przy użyciu sztucznej inteligencji (OpenAI).</p>
 <b>Kroki:</b>
@@ -359,7 +452,7 @@ class MainWindow(QMainWindow):
         btn_desc_generator.clicked.connect(self.run_description_generator_dialog)
         right_column_layout.addLayout(desc_generator_layout)
 
-        # 8. Attribute Translator
+        # Attribute Translator
         attr_translator_tooltip = """<h3>Moduł: Tłumacz Atrybutów ALT/TITLE</h3>
 <p><b>Cel:</b> Tłumaczenie atrybutów 'alt' i 'title' w tagach HTML w wybranej kolumnie pliku CSV.</p>
 <b>Kroki:</b>
@@ -414,6 +507,15 @@ class MainWindow(QMainWindow):
         dialog = TranslatorDialog(self)
         dialog.exec()
 
+    def open_description_updater_dialog(self):
+        api_key = self.api_key_input.text().strip()
+        base_url = self.base_url_input.text().strip()
+        if not api_key or not base_url:
+            self.log("BŁĄD: Base URL i Klucz API w głównym oknie nie mogą być puste!")
+            return
+        dialog = DescriptionUpdaterDialog(api_key=api_key, base_url=base_url, parent=self)
+        dialog.exec()
+
     def run_description_generator_dialog(self):
         if not self.description_dialog:
             self.description_dialog = DescriptionGeneratorDialog(self)
@@ -428,19 +530,29 @@ class MainWindow(QMainWindow):
         base_url = self.base_url_input.text()
         api_key = self.api_key_input.text()
         
-        if func not in [run_filter]:
+        # Functions that do not need API credentials
+        local_functions = [run_filter] 
+        
+        if func not in local_functions:
             if not base_url or not api_key:
                 self.log("BŁĄD: Base URL i API Key nie mogą być puste!")
                 return
         
         final_kwargs = {}
-        if func not in [run_filter]:
+        if func not in local_functions:
             final_kwargs['base_url'] = base_url
             final_kwargs['api_key'] = api_key
+        
+        # Add progress_callback to all functions that are expected to yield progress
+        if func not in []: # Assuming all background tasks are generators
+             final_kwargs['progress_callback'] = self.log
+
         final_kwargs.update(kwargs)
 
         self.set_buttons_enabled(False)
         self.log(f"--- Rozpoczynam zadanie: {func.__name__} ---")
+        
+        # The worker now handles the generator function correctly
         self.worker = Worker(func, *args, **final_kwargs)
         self.worker.progress.connect(self.log)
         self.worker.finished.connect(self.task_finished)
@@ -451,6 +563,16 @@ class MainWindow(QMainWindow):
 
     def run_description_downloader_task(self):
         self._start_task(run_description_downloader)
+
+    def run_id_based_downloader_task(self):
+        dialog = IdBasedDownloaderDialog(self)
+        if dialog.exec():
+            csv_path = dialog.get_data()
+            if not csv_path:
+                self.log("BŁĄD: Nie wybrano pliku CSV.")
+                return
+            # The progress_callback is now handled by _start_task
+            self._start_task(run_id_based_downloader, input_csv_path=csv_path)
 
     def run_filter_task(self):
         dialog = FilterDialog(self)
@@ -473,14 +595,31 @@ class MainWindow(QMainWindow):
     def run_pinner_task(self):
         dialog = PinnerDialog(self)
         if dialog.exec():
-            shop_id, menu_id, csv_path, num_workers = dialog.get_data()
+            (
+                shop_id, 
+                menu_id, 
+                csv_path, 
+                timeout, 
+                delay,
+                long_pause_batch_count,
+                long_pause_duration_minutes
+            ) = dialog.get_data()
             if not (shop_id.isdigit() and menu_id.isdigit()):
                 self.log("BŁĄD: Shop ID i Menu ID muszą być liczbami.")
                 return
             if not csv_path:
                 self.log("BŁĄD: Musisz wybrać plik CSV.")
                 return
-            self._start_task(run_pinner, shop_id=int(shop_id), menu_id=int(menu_id), csv_filename=csv_path, num_workers=num_workers)
+            self._start_task(
+                run_pinner, 
+                shop_id=int(shop_id), 
+                menu_id=int(menu_id), 
+                csv_filename=csv_path, 
+                timeout=timeout, 
+                delay=delay,
+                long_pause_batch_count=long_pause_batch_count,
+                long_pause_duration_minutes=long_pause_duration_minutes
+            )
 
     def run_copy_menu_nodes_task(self):
         dialog = NewModulesDialog("Kopiuj strukturę menu (węzły)", self)
