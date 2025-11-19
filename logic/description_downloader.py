@@ -121,6 +121,6 @@ def process_and_save_to_csv(products):
     except IOError as io_err:
         yield f"BŁĄD: Nie udało się zapisać pliku '{OUTPUT_FILENAME}'. Powód: {io_err}"
 
-def run_description_downloader(base_url, api_key):
+def run_description_downloader(base_url, api_key, progress_callback=None):
     """Główna funkcja uruchamiająca pobieranie opisów."""
     yield from fetch_all_products(base_url, api_key)

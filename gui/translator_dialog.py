@@ -12,18 +12,20 @@ import random
 import logging
 import requests
 import io
+import traceback
 
 from PyQt6.QtWidgets import (
     QDialog, QVBoxLayout, QHBoxLayout, QPushButton, QComboBox, QLineEdit, 
     QTextEdit, QProgressBar, QLabel, QFileDialog, QCheckBox,
     QMessageBox, QDialogButtonBox, QGroupBox
 )
-from PyQt6.QtCore import QThread, pyqtSignal, QObject
+from PyQt6.QtCore import QThread, pyqtSignal, QObject, QSettings
 
 # --- Konfiguracja ---
 ID_COLUMN = 'ID'
 ACTIVATE_COOLDOWN_AFTER_RETRIES = 2
 GLOBAL_COOLDOWN_MINUTES = 15
+CHARACTER_LIMIT = 4800 # Google's unofficial limit is ~5000
 
 class RateLimiter:
     def __init__(self, requests_per_second):
@@ -47,11 +49,11 @@ class TranslationWorker(QObject):
     log_info = pyqtSignal(str)
     log_error = pyqtSignal(str)
     update_status = pyqtSignal(str)
-    finished = pyqtSignal(str, float)
+    finished = pyqtSignal(object, float)
     cooldown_started = pyqtSignal(int)
     cooldown_finished = pyqtSignal()
 
-    def __init__(self, parent_dialog, source_lang, target_lang, columns_to_translate, num_workers, requests_per_sec, input_csv_path, is_diagnostic_mode):
+    def __init__(self, parent_dialog, source_lang, target_lang, columns_to_translate, num_workers, requests_per_sec, input_csv_path, is_diagnostic_mode, id_column, is_patch_mode=False):
         super().__init__()
         self.d = parent_dialog
         self.global_cooldown_lock = threading.Lock()
@@ -62,41 +64,57 @@ class TranslationWorker(QObject):
         self.requests_per_sec = requests_per_sec
         self.input_csv_path = input_csv_path
         self.is_diagnostic_mode = is_diagnostic_mode
+        self.id_column = id_column
+        self.is_patch_mode = is_patch_mode
+        self.translation_errors = []
+        self.error_lock = threading.Lock()
+        self.is_cancelled = False
 
-    def translation_worker_thread(self, worker_id, chunks, source, target, limiter, results):
-        self.log_info.emit(f"[Wątek {worker_id}] Start: {len(chunks)} fragmentów.")
+
+    def translation_worker_thread(self, worker_id, fragment_chunks, source, target, limiter, results):
+        self.log_info.emit(f"[Wątek {worker_id}] Start: {len(fragment_chunks)} fragmentów.")
         translated, translator = [], GoogleTranslator(source=source, target=target)
-        batch, chars, total, processed = [], 0, len(chunks), 0
+        batch_fragments, batch_texts, chars, total, processed = [], [], 0, len(fragment_chunks), 0
         chunk_idx = 0
-        while chunk_idx < len(chunks):
-            chunk = chunks[chunk_idx]
-            if not chunk or not chunk.strip():
-                batch.append(' ')
+        
+        while chunk_idx < len(fragment_chunks):
+            if self.is_cancelled:
+                self.log_info.emit(f"[Wątek {worker_id}] Anulowano.")
+                break
+
+            fragment = fragment_chunks[chunk_idx]
+            text_chunk = fragment['text']
+
+            if not text_chunk or not text_chunk.strip():
+                batch_fragments.append(fragment)
+                batch_texts.append(' ')
                 chunk_idx += 1
                 continue
-
-            if chars + len(chunk) > 4800 and batch:
+            
+            if chars + len(text_chunk) > CHARACTER_LIMIT and batch_texts:
                 pass
             else:
-                batch.append(chunk)
-                chars += len(chunk)
+                batch_fragments.append(fragment)
+                batch_texts.append(text_chunk)
+                chars += len(text_chunk)
                 chunk_idx += 1
-            
-            if chunk_idx < len(chunks) and (chars + len(chunks[chunk_idx]) <= 4800):
-                continue
 
+            if chunk_idx < len(fragment_chunks) and (chars + len(fragment_chunks[chunk_idx]['text']) <= CHARACTER_LIMIT):
+                continue
+            
             is_successful, retries = False, 0
             while not is_successful:
+                if self.is_cancelled: break
                 with self.global_cooldown_lock:
                     pass
 
                 limiter.wait()
                 try:
-                    t_batch = translator.translate_batch(batch)
-                    safe_t_batch = [t if t is not None else o for o, t in zip(batch, t_batch)]
+                    t_batch = translator.translate_batch(batch_texts)
+                    safe_t_batch = [t if t is not None else o for o, t in zip(batch_texts, t_batch)]
                     translated.extend(safe_t_batch)
-                    processed += len(batch)
-                    self.log_info.emit(f"[Wątek {worker_id}] OK: {len(batch)} frag. ({processed}/{total})")
+                    processed += len(batch_texts)
+                    self.log_info.emit(f"[Wątek {worker_id}] OK: {len(batch_texts)} frag. ({processed}/{total})")
                     is_successful = True
                 except Exception as e:
                     if "too many requests" in str(e).lower():
@@ -107,6 +125,7 @@ class TranslationWorker(QObject):
                                 cooldown_seconds = GLOBAL_COOLDOWN_MINUTES * 60
                                 self.cooldown_started.emit(cooldown_seconds)
                                 time.sleep(cooldown_seconds)
+                                if self.is_cancelled: break
                                 self.cooldown_finished.emit()
                                 self.global_cooldown_lock.release()
                             else:
@@ -117,147 +136,196 @@ class TranslationWorker(QObject):
                             self.log_error.emit(f"[Wątek {worker_id}] LIMIT! Próba {retries}. Czekam {delay:.1f}s...")
                             time.sleep(delay)
                     else:
-                        self.log_error.emit(f"[Wątek {worker_id}] BŁĄD KRYTYCZNY: {e}. Używam oryginałów.")
-                        translated.extend(batch)
+                        self.log_error.emit(f"[Wątek {worker_id}] BŁĄD KRYTYCZNY paczki: {e}. Przełączam na tryb pojedynczy dla tej paczki.")
+                        
+                        # Fallback to individual translation
+                        fallback_translated = []
+                        for i, text_to_translate in enumerate(batch_texts):
+                            try:
+                                limiter.wait()
+                                translated_text = translator.translate(text_to_translate)
+                                fallback_translated.append(translated_text if translated_text else text_to_translate)
+                            except Exception as single_e:
+                                self.log_error.emit(f"[Wątek {worker_id}] Błąd pojedynczego tłumaczenia: {single_e}. Używam oryginału.")
+                                fallback_translated.append(text_to_translate)
+                                with self.error_lock:
+                                    frag = batch_fragments[i]
+                                    self.translation_errors.append({
+                                        'product_id': frag['product_id'],
+                                        'column': frag['col_name'],
+                                        'original_content': frag['original_cell_content']
+                                    })
+                        
+                        translated.extend(fallback_translated)
                         is_successful = True
             
-            self.progress.emit(len(batch))
-            batch, chars = [], 0
+            self.progress.emit(len(batch_texts))
+            batch_fragments, batch_texts, chars = [], [], 0
         results[worker_id] = translated
         self.log_info.emit(f"[Wątek {worker_id}] Koniec.")
 
     def run(self):
         start_time = time.time()
-        skipped_cells_report = []
+        output_result = ""
         try:
             self.log_info.emit(f"--- Start tłumaczenia z '{self.source_lang.upper()}' na '{self.target_lang.upper()}' ---")
-            if self.is_diagnostic_mode:
-                self.log_info.emit("Tryb diagnostyczny jest włączony. Generowanie raportu pominiętych komórek.")
+            if self.is_patch_mode:
+                self.log_info.emit("--- TRYB POPRAWEK AKTYWNY ---")
 
             df = pd.read_csv(self.input_csv_path, on_bad_lines='skip').fillna('')
             
+            if self.id_column not in df.columns:
+                self.log_error.emit(f"Błąd krytyczny: Podana kolumna ID '{self.id_column}' nie istnieje w pliku CSV.")
+                raise FileNotFoundError(f"Missing ID column: {self.id_column}")
+
             cells_to_process = []
-            all_texts_to_translate = []
+            all_fragments_to_translate = []
             whitespace_map = []
 
             for col in self.columns_to_translate:
+                if self.is_cancelled: break
                 if col not in df.columns: continue
-                for i, cell_content in enumerate(df[col]):
-                    original_content = cell_content
-                    cell_content_str = str(cell_content)
+                for i, row in df.iterrows():
+                    if self.is_cancelled: break
+                    original_content = row[col]
+                    cell_content_str = str(original_content)
+                    product_id = row[self.id_column]
 
-                    if not cell_content_str.strip():
-                        if self.is_diagnostic_mode:
-                            skipped_cells_report.append({
-                                'Wiersz': i + 2,
-                                'Kolumna': col,
-                                'Powód': 'Komórka jest pusta lub zawiera tylko białe znaki',
-                                'Zawartość': original_content
-                            })
-                        continue
+                    if not cell_content_str.strip(): continue
 
                     texts_for_this_cell = []
                     soup = BeautifulSoup(cell_content_str, "html.parser")
                     nodes_to_process = soup.find_all(string=True)
                     
                     for node in nodes_to_process:
-                        if node.parent.name in ['style', 'script', 'head', 'title', 'meta']:
-                            continue
-                        if node.strip():
-                            text = str(node)
-                            has_leading = text.startswith(' ')
-                            has_trailing = text.endswith(' ')
+                        if self.is_cancelled: break
+                        if node.parent.name in ['style', 'script', 'head', 'title', 'meta'] or not node.strip(): continue
+                        
+                        original_text_node = str(node)
+                        
+                        if len(original_text_node) > CHARACTER_LIMIT:
+                            self.log_info.emit(f"Wykryto fragment > {CHARACTER_LIMIT} znaków (ID: {product_id}, Kol: {col}). Dzielenie na zdania...")
+                            sentences = re.split(r'(?<=[.!?])\s+', original_text_node)
+                            
+                            sub_fragments = []
+                            current_chunk = ""
+                            for sentence in sentences:
+                                if len(current_chunk) + len(sentence) + 1 > CHARACTER_LIMIT:
+                                    if current_chunk: sub_fragments.append(current_chunk)
+                                    current_chunk = sentence
+                                else:
+                                    current_chunk = f"{current_chunk} {sentence}" if current_chunk else sentence
+                            if current_chunk: sub_fragments.append(current_chunk)
+
+                            for sub_frag_text in sub_fragments:
+                                has_leading = sub_frag_text.startswith(' ')
+                                has_trailing = sub_frag_text.endswith(' ')
+                                whitespace_map.append({'leading': has_leading, 'trailing': has_trailing})
+                                fragment_info = {
+                                    'text': sub_frag_text.strip(), 'product_id': product_id,
+                                    'original_cell_content': original_content, 'col_name': col
+                                }
+                                texts_for_this_cell.append(fragment_info)
+                        else:
+                            has_leading = original_text_node.startswith(' ')
+                            has_trailing = original_text_node.endswith(' ')
                             whitespace_map.append({'leading': has_leading, 'trailing': has_trailing})
-                            texts_for_this_cell.append(text.strip())
+                            fragment_info = {
+                                'text': original_text_node.strip(), 'product_id': product_id,
+                                'original_cell_content': original_content, 'col_name': col
+                            }
+                            texts_for_this_cell.append(fragment_info)
 
-                    if texts_for_this_cell:
-                        # Determine if the original was HTML for reconstruction purposes
+                    if not self.is_cancelled and texts_for_this_cell:
                         is_html = bool(BeautifulSoup(original_content, "html.parser").find())
-                        cells_to_process.append({'loc': (i, col), 'is_html': is_html, 'count': len(texts_for_this_cell)})
-                        all_texts_to_translate.extend(texts_for_this_cell)
-                    elif self.is_diagnostic_mode:
-                        skipped_cells_report.append({
-                            'Wiersz': i + 2,
-                            'Kolumna': col,
-                            'Powód': 'Brak tekstu do tłumaczenia (np. tylko puste tagi HTML)',
-                            'Zawartość': original_content
-                        })
+                        cells_to_process.append({'loc': (i, col), 'is_html': is_html, 'count': len(texts_for_this_cell), 'product_id': product_id, 'col_name': col})
+                        all_fragments_to_translate.extend(texts_for_this_cell)
 
-            if not all_texts_to_translate:
-                self.log_info.emit("Nie znaleziono żadnych tekstów do tłumaczenia we wszystkich wybranych komórkach.")
-                if self.is_diagnostic_mode and skipped_cells_report:
-                    # Save report even if no texts were found to translate
-                    report_df = pd.DataFrame(skipped_cells_report)
-                    report_path = os.path.join(os.path.dirname(self.input_csv_path), "raport_pominietych_komorek.csv")
-                    report_df.to_csv(report_path, index=False, encoding='utf-8-sig')
-                    self.log_info.emit(f"Wygenerowano raport pominiętych komórek: {report_path}")
-                self.finished.emit("", 0)
-                return
+                if self.is_cancelled: break
 
-            self.d.total_chunks_to_process = len(all_texts_to_translate)
-            self.log_info.emit(f"Znaleziono {len(cells_to_process)} komórek zawierających tekst, łącznie {self.d.total_chunks_to_process} fragmentów do tłumaczenia.")
+            if self.is_cancelled: raise InterruptedError("Proces anulowany przez użytkownika.")
+            if not all_fragments_to_translate:
+                self.log_info.emit("Nie znaleziono żadnych tekstów do tłumaczenia.")
+                raise InterruptedError("Brak tekstów.")
+
+            self.d.total_chunks_to_process = len(all_fragments_to_translate)
+            self.log_info.emit(f"Znaleziono {len(cells_to_process)} komórek, łącznie {self.d.total_chunks_to_process} fragmentów do tłumaczenia (po podziale).")
             
             limiter = RateLimiter(self.requests_per_sec)
-            chunk_split = math.ceil(len(all_texts_to_translate) / self.num_workers) if self.num_workers > 0 else len(all_texts_to_translate)
-            chunk_groups = [all_texts_to_translate[i:i + chunk_split] for i in range(0, len(all_texts_to_translate), chunk_split)]
+            chunk_split = math.ceil(len(all_fragments_to_translate) / self.num_workers) if self.num_workers > 0 else len(all_fragments_to_translate)
+            chunk_groups = [all_fragments_to_translate[i:i + chunk_split] for i in range(0, len(all_fragments_to_translate), chunk_split)]
 
             threads, results = [], [[] for _ in chunk_groups]
             for i, group in enumerate(chunk_groups):
+                if not group: continue
                 thread = threading.Thread(target=self.translation_worker_thread, args=(i, group, self.source_lang, self.target_lang, limiter, results))
                 threads.append(thread)
                 thread.start()
-            
             for thread in threads: thread.join()
+
+            if self.is_cancelled: raise InterruptedError("Proces anulowany przez użytkownika.")
             
             translated_texts_stripped = [chunk for res_list in results for chunk in res_list]
             
-            translated_texts = []
-            for i, text in enumerate(translated_texts_stripped):
-                if i < len(whitespace_map):
-                    ws_info = whitespace_map[i]
-                    restored_text = text
-                    if ws_info['leading']: restored_text = ' ' + restored_text
-                    if ws_info['trailing']: restored_text = restored_text + ' '
-                    translated_texts.append(restored_text)
-                else:
-                    translated_texts.append(text) # Fallback
+            translated_texts = [f"{(' ' if ws['leading'] else '')}{text}{(' ' if ws['trailing'] else '')}" for text, ws in zip(translated_texts_stripped, whitespace_map)]
 
             text_ptr = 0
+            successful_patches = []
+            
+            original_error_ids = { (err['product_id'], err['column']) for err in self.translation_errors }
+
             for cell_info in cells_to_process:
+                is_error_cell = False
+                fragments_for_this_cell = all_fragments_to_translate[text_ptr : text_ptr + cell_info['count']]
+                if any((frag['product_id'], frag['col_name']) in original_error_ids for frag in fragments_for_this_cell):
+                    is_error_cell = True
+
                 translated_parts = translated_texts[text_ptr : text_ptr + cell_info['count']]
                 text_ptr += cell_info['count']
+
+                if is_error_cell:
+                    continue
                 
                 if cell_info['is_html']:
-                    # Use original content to reconstruct, not df.at, which might be a different type
-                    original_cell_content = str(df.iloc[cell_info['loc'][0]][cell_info['loc'][1]])
-                    soup = BeautifulSoup(original_cell_content, "html.parser")
-                    nodes_to_replace = [node for node in soup.find_all(string=True) if node.parent.name not in ['style', 'script', 'head', 'title', 'meta'] and node.strip()]
+                    new_soup = BeautifulSoup(str(df.iloc[cell_info['loc'][0]][cell_info['loc'][1]]), 'html.parser')
                     
-                    for i, node in enumerate(nodes_to_replace):
+                    text_nodes_in_soup = [node for node in new_soup.find_all(string=True) if node.parent.name not in ['style', 'script', 'head', 'title', 'meta'] and node.strip()]
+                    
+                    for i, node in enumerate(text_nodes_in_soup):
                         if i < len(translated_parts):
                             node.replace_with(translated_parts[i])
-
-                    df.at[cell_info['loc']] = str(soup)
+                    new_content = str(new_soup)
                 else:
-                    df.at[cell_info['loc']] = "".join(translated_parts)
+                    new_content = "".join(translated_parts)
+                
+                if self.is_patch_mode:
+                    successful_patches.append({'product_id': cell_info['product_id'], 'column': cell_info['col_name'], 'new_content': new_content})
+                else:
+                    df.at[cell_info['loc']] = new_content
 
-            base, ext = os.path.splitext(os.path.basename(self.input_csv_path))
-            output_path = os.path.join(os.path.dirname(self.input_csv_path), f"{base}_translated{ext}")
-            df.to_csv(output_path, index=False, encoding='utf-8')
-            
-            if self.is_diagnostic_mode and skipped_cells_report:
-                report_df = pd.DataFrame(skipped_cells_report)
-                report_path = os.path.join(os.path.dirname(self.input_csv_path), "raport_pominietych_komorek.csv")
-                report_df.to_csv(report_path, index=False, encoding='utf-8-sig')
-                self.log_info.emit(f"Wygenerowano raport pominiętych komórek: {report_path}")
+            if self.is_patch_mode:
+                output_result = successful_patches
+            else:
+                base, ext = os.path.splitext(os.path.basename(self.input_csv_path))
+                output_path = os.path.join(os.path.dirname(self.input_csv_path), f"{base}_translated{ext}")
+                df.to_csv(output_path, index=False, encoding='utf-8-sig')
+                output_result = output_path
 
-            total_time = time.time() - start_time
-            self.finished.emit(output_path, total_time)
+            if self.translation_errors:
+                error_df = pd.DataFrame(self.translation_errors).drop_duplicates(subset=['product_id', 'column'])
+                error_output_path = os.path.join(os.path.dirname(self.input_csv_path), "translator_errors.csv")
+                if not error_df.empty:
+                    error_df.to_csv(error_output_path, index=False, encoding='utf-8-sig')
+                    self.log_info.emit(f"Zapisano {len(error_df)} unikalnych błędów w pliku: {error_output_path}")
 
+        except (InterruptedError, FileNotFoundError) as e:
+            self.log_info.emit(str(e))
         except Exception as e:
             self.log_error.emit(f"BŁĄD KRYTYCZNY w głównym wątku: {e}")
-            import traceback
             self.log_error.emit(traceback.format_exc())
+        finally:
+            total_time = time.time() - start_time
+            self.finished.emit(output_result, total_time)
 
 
 
@@ -275,6 +343,35 @@ class TranslatorDialog(QDialog):
 
         self.initUI()
         self.prepare_language_list()
+        self.load_settings()
+
+    def save_settings(self):
+        settings = QSettings("IdoKombajn", "Translator")
+        settings.setValue("input_path", self.input_csv_path)
+        settings.setValue("source_lang", self.source_lang_combo.currentText())
+        settings.setValue("target_lang", self.target_lang_combo.currentText())
+        settings.setValue("id_column", self.id_column_input.text())
+        settings.setValue("num_workers", self.num_workers_input.text())
+        settings.setValue("requests_per_sec", self.requests_per_sec_input.text())
+        
+        checked_columns = [col for col, cb in self.column_vars.items() if cb.isChecked()]
+        settings.setValue("checked_columns", ",".join(checked_columns))
+
+    def load_settings(self):
+        settings = QSettings("IdoKombajn", "Translator")
+        
+        input_path = settings.value("input_path", "")
+        if input_path and os.path.exists(input_path):
+            self.input_csv_path = input_path
+            self.selected_file_label.setText(os.path.basename(input_path))
+            self.load_columns_button.setEnabled(True)
+            self.load_columns_from_csv()
+
+        self.source_lang_combo.setCurrentText(settings.value("source_lang", "Polski"))
+        self.target_lang_combo.setCurrentText(settings.value("target_lang", "Angielski"))
+        self.id_column_input.setText(settings.value("id_column", "ID"))
+        self.num_workers_input.setText(settings.value("num_workers", "3"))
+        self.requests_per_sec_input.setText(settings.value("requests_per_sec", "3.0"))
 
     def initUI(self):
         main_layout = QVBoxLayout(self)
@@ -303,6 +400,16 @@ class TranslatorDialog(QDialog):
         self.target_lang_combo = QComboBox()
         lang_layout.addWidget(self.target_lang_combo)
         settings_layout.addLayout(lang_layout)
+
+        id_col_layout = QHBoxLayout()
+        id_col_layout.addWidget(QLabel("Kolumna z ID produktu:"))
+        self.id_column_input = QLineEdit("ID")
+        id_col_layout.addWidget(self.id_column_input)
+        id_col_info_label = QLabel("ⓘ")
+        id_col_info_label.setToolTip("Podaj nazwę kolumny, która zawiera unikalny identyfikator produktu (np. ID, product_id, SKU).")
+        id_col_layout.addWidget(id_col_info_label)
+        id_col_layout.addStretch()
+        settings_layout.addLayout(id_col_layout)
 
         adv_layout = QVBoxLayout()
 
@@ -351,13 +458,18 @@ class TranslatorDialog(QDialog):
         start_layout = QHBoxLayout()
         self.start_button = QPushButton("Rozpocznij tłumaczenie")
         self.start_button.clicked.connect(self.start_translation)
+        self.reprocess_button = QPushButton("Popraw błędy z ostatniego uruchomienia")
+        self.reprocess_button.clicked.connect(self.start_reprocessing)
+        self.cancel_button = QPushButton("Anuluj")
+        self.cancel_button.clicked.connect(self.cancel_translation)
+        self.cancel_button.hide()
         
         info_label = QLabel("ⓘ")
         info_label.setToolTip(
             """<h3>Jak działa tłumacz?</h3>
             <p>Proces jest podzielony na 4 główne kroki:</p>
             <ol>
-                <li><b>Przygotowanie:</b> Po wybraniu pliku, kolumn i ustawień, aplikacja tworzy w tle "pracownika", który zajmie się tłumaczeniem, nie blokując interfejsu.</li>
+                <li><b>Przygotowanie:</b> Po wybraniu pliku, kolumn i ustawień, aplikacja tworzy w tle \"pracownika\", który zajmie się tłumaczeniem, nie blokując interfejsu.</li>
                 <li><b>Ekstrakcja tekstu:</b>
                     <ul>
                         <li>Pracownik analizuje każdą wybraną komórkę w pliku CSV.</li>
@@ -368,21 +480,22 @@ class TranslatorDialog(QDialog):
                 </li>
                 <li><b>Tłumaczenie równoległe:</b>
                     <ul>
-                        <li>Wszystkie zebrane teksty (już bez "chronionych" spacji) są dzielone na paczki i wysyłane do tłumaczenia w wielu wątkach jednocześnie (zgodnie z Twoimi ustawieniami).</li>
-                        <li><b>Ochrona przed banem:</b> Specjalny "hamulec" pilnuje, aby nie wysłać zbyt wielu zapytań na sekundę. W razie tymczasowej blokady od Google, proces jest automatycznie wstrzymywany na 15 minut i wznawiany.</li>
+                        <li>Wszystkie zebrane teksty (już bez \"chronionych\" spacji) są dzielone na paczki i wysyłane do tłumaczenia w wielu wątkach jednocześnie (zgodnie z Twoimi ustawieniami).</li>
+                        <li><b>Ochrona przed banem:</b> Specjalny \"hamulec\" pilnuje, aby nie wysłać zbyt wielu zapytań na sekundę. W razie tymczasowej blokady od Google, proces jest automatycznie wstrzymywany na 15 minut i wznawiany.</li>
                     </ul>
                 </li>
                 <li><b>Składanie i zapis:</b>
                     <ul>
                         <li>Pracownik odbiera przetłumaczone teksty.</li>
-                        <li>Na podstawie zapamiętanych informacji odtwarza "chronione" spacje, dodając je z powrotem do tłumaczeń.</li>
+                        <li>Na podstawie zapamiętanych informacji odtwarza \"chronione\" spacje, dodając je z powrotem do tłumaczeń.</li>
                         <li>Wstawia przetłumaczony tekst z powrotem w jego oryginalne miejsce w strukturze HTML.</li>
-                        <li>Gotowy wynik jest zapisywany do nowego pliku CSV z końcówką "_translated".</li>
+                        <li>Gotowy wynik jest zapisywany do nowego pliku CSV z końcówką \"_translated\".</li>
                     </ul>
                 </li>
-            </ol>"""
-        )
+            </ol>""")
         start_layout.addWidget(self.start_button)
+        start_layout.addWidget(self.reprocess_button)
+        start_layout.addWidget(self.cancel_button)
         start_layout.addWidget(info_label)
         start_layout.addStretch()
         main_layout.addLayout(start_layout)
@@ -405,9 +518,9 @@ class TranslatorDialog(QDialog):
         main_layout.addWidget(button_box)
 
         self.controls_to_toggle = [
-            self.select_file_button, self.load_columns_button, self.start_button,
+            self.select_file_button, self.load_columns_button, self.reprocess_button,
             self.source_lang_combo, self.target_lang_combo, self.num_workers_input,
-            self.requests_per_sec_input
+            self.requests_per_sec_input, self.id_column_input
         ]
 
 
@@ -436,13 +549,14 @@ class TranslatorDialog(QDialog):
             self.selected_file_label.setText(os.path.basename(path))
             self.log_info(f"Wybrano plik: {path}")
             self.load_columns_button.setEnabled(True)
+            self.load_columns_from_csv()
 
     def load_columns_from_csv(self):
         if not self.input_csv_path:
             QMessageBox.critical(self, "Błąd", "Najpierw wybierz plik!")
             return
         
-        for i in reversed(range(self.column_checkbox_layout.count())): 
+        for i in reversed(range(self.column_checkbox_layout.count())):
             self.column_checkbox_layout.itemAt(i).widget().setParent(None)
         self.column_vars = {}
 
@@ -450,22 +564,66 @@ class TranslatorDialog(QDialog):
             df_columns = pd.read_csv(self.input_csv_path, nrows=0, on_bad_lines='skip').columns.tolist()
             self.log_info(f"Znaleziono kolumny: {df_columns}")
             for col in df_columns:
-                if col != ID_COLUMN:
+                if col != self.id_column_input.text().strip():
                     cb = QCheckBox(col)
                     self.column_checkbox_layout.addWidget(cb)
                     self.column_vars[col] = cb
+            
+            # Zastosuj zapisane ustawienia kolumn
+            settings = QSettings("IdoKombajn", "Translator")
+            checked_columns_str = settings.value("checked_columns", "")
+            if checked_columns_str:
+                checked_columns = checked_columns_str.split(',')
+                for col, cb in self.column_vars.items():
+                    if col in checked_columns:
+                        cb.setChecked(True)
+
         except Exception as e:
             QMessageBox.critical(self, "Błąd", f"Nie można wczytać pliku: {e}")
 
-    def start_translation(self):
+    def cancel_translation(self):
+        if hasattr(self, 'worker'):
+            self.log_info("!!! Otrzymano żądanie anulowania. Kończenie pracy po bieżącej paczce...")
+            self.worker.is_cancelled = True
+            self.cancel_button.setEnabled(False)
+            self.status_label.setText("Anulowanie...")
+
+    def start_reprocessing(self):
+        settings = QSettings("IdoKombajn", "Translator")
+        last_output = settings.value("last_output_path", "")
+        if not last_output or not os.path.exists(last_output):
+            QMessageBox.critical(self, "Błąd", "Nie znaleziono ścieżki do ostatniego pliku wynikowego. Uruchom normalne tłumaczenie przynajmniej raz.")
+            return
+
+        error_file_path = os.path.join(os.path.dirname(last_output), "translator_errors.csv")
+        if not os.path.exists(error_file_path):
+            QMessageBox.information(self, "Informacja", "Nie znaleziono pliku 'translator_errors.csv'. Wygląda na to, że nie było błędów do poprawienia.")
+            return
+        
+        self.input_csv_path = error_file_path
+        self.selected_file_label.setText(os.path.basename(error_file_path))
+        self.log_info(f"Wybrano plik z błędami: {error_file_path}")
+        self.load_columns_from_csv()
+        self.start_translation(is_patch_mode=True)
+
+
+    def start_translation(self, is_patch_mode=False):
         if not self.input_csv_path:
             QMessageBox.critical(self, "Błąd", "Wybierz plik!")
             return
+
+        if not is_patch_mode:
+            self.save_settings()
 
         source_display = self.source_lang_combo.currentText()
         target_display = self.target_lang_combo.currentText()
         source = self.language_map_display[source_display]
         target = self.language_map_display[target_display]
+        
+        id_column = self.id_column_input.text().strip()
+        if not id_column:
+            QMessageBox.critical(self, "Błąd", "Nazwa kolumny ID nie może być pusta!")
+            return
 
         columns = [col for col, cb in self.column_vars.items() if cb.isChecked()]
         if not columns:
@@ -491,11 +649,16 @@ class TranslatorDialog(QDialog):
         self.start_time = time.time()
 
         self.thread = QThread()
-        self.worker = TranslationWorker(self, source, target, columns, num_workers, requests_per_sec, self.input_csv_path, is_diagnostic_mode)
+        self.worker = TranslationWorker(self, source, target, columns, num_workers, requests_per_sec, self.input_csv_path, is_diagnostic_mode, id_column, is_patch_mode)
         self.worker.moveToThread(self.thread)
 
+        # Proper Qt thread management
         self.thread.started.connect(self.worker.run)
+        self.worker.finished.connect(self.thread.quit)
+        self.worker.finished.connect(self.worker.deleteLater)
+        self.thread.finished.connect(self.thread.deleteLater)
         
+        # Connect other signals
         self.worker.progress.connect(self.update_progress)
         self.worker.log_info.connect(self.log_info)
         self.worker.log_error.connect(self.log_error)
@@ -504,7 +667,6 @@ class TranslatorDialog(QDialog):
         self.worker.cooldown_started.connect(self.handle_cooldown_start)
         self.worker.cooldown_finished.connect(self.handle_cooldown_finish)
 
-        self.thread.finished.connect(self.thread.deleteLater)
         self.thread.start()
 
     def update_progress(self, count):
@@ -518,15 +680,55 @@ class TranslatorDialog(QDialog):
         frac = p / m if m > 0 else 0
         etr = (elapsed / frac - elapsed) if frac > 0.01 else 0
         
-        if not self.is_cooldown:
+        if not self.is_cooldown and (not hasattr(self.worker, 'is_cancelled') or not self.worker.is_cancelled):
             self.status_label.setText(f"Tłumaczenie: {p}/{m} | Pozostały czas: ~{self.format_time(etr)}")
 
-    def task_finished(self, output_path, total_time):
-        self.log_info(f"--- ZAKOŃCZONO ---")
-        self.log_info(f"Wyniki zapisano w '{output_path}'.")
-        self.status_label.setText(f"Zakończono! Czas: {self.format_time(total_time)}.")
+    def task_finished(self, result, total_time):
+        if hasattr(self, 'worker') and self.worker.is_cancelled:
+            self.log_info("--- ZADANIE ANULOWANE PRZEZ UŻYTKOWNIKA ---")
+            self.status_label.setText(f"Anulowano. Całkowity czas: {self.format_time(total_time)}.")
+        elif isinstance(result, list): # Patch mode successful
+            self.log_info("--- ZAKOŃCZONO TRYB POPRAWEK ---")
+            if not result:
+                self.log_info("Nie udało się przetłumaczyć żadnych nowych pozycji z pliku błędów.")
+            else:
+                self.log_info(f"Pomyślnie przetłumaczono {len(result)} pozycji. Aktualizowanie głównego pliku wynikowego...")
+                try:
+                    settings = QSettings("IdoKombajn", "Translator")
+                    last_output_path = settings.value("last_output_path", "")
+                    id_column = settings.value("id_column", "ID")
+                    if not last_output_path or not os.path.exists(last_output_path):
+                        self.log_error("Nie można znaleźć głównego pliku wynikowego do zaktualizowania!")
+                    else:
+                        df = pd.read_csv(last_output_path, on_bad_lines='skip', dtype={{id_column: str}}).fillna('')
+                        df.set_index(id_column, inplace=True)
+                        for patch in result:
+                            # Ensure product_id is treated as a string for lookup
+                            product_id_str = str(patch['product_id'])
+                            if product_id_str in df.index:
+                                df.loc[product_id_str, patch['column']] = patch['new_content']
+                            else:
+                                self.log_error(f"Nie znaleziono ID '{product_id_str}' w pliku wynikowym. Pomijanie poprawki.")
+                        
+                        df.reset_index(inplace=True)
+                        df.to_csv(last_output_path, index=False, encoding='utf-8-sig')
+                        self.log_info(f"✅ Pomyślnie zaktualizowano plik: {last_output_path}")
+                except Exception as e:
+                    self.log_error(f"Nie udało się zaktualizować pliku wynikowego: {e}")
+                    self.log_error(traceback.format_exc())
+            self.status_label.setText(f"Zakończono poprawki. Czas: {self.format_time(total_time)}.")
+        elif isinstance(result, str) and result: # Normal run successful
+            self.log_info(f"--- ZAKOŃCZONO ---")
+            self.log_info(f"Wyniki zapisano w '{result}'.")
+            settings = QSettings("IdoKombajn", "Translator")
+            settings.setValue("last_output_path", result)
+            self.status_label.setText(f"Zakończono! Czas: {self.format_time(total_time)}.")
+        else: # Normal run with no texts or other issues
+             self.log_info(f"--- ZAKOŃCZONO Z UWAGAMI ---")
+             self.status_label.setText(f"Zakończono z uwagami. Czas: {self.format_time(total_time)}.")
+
         self.toggle_controls(True)
-        self.thread.quit()
+        # No longer need to manually quit the thread here
 
     def log_info(self, message):
         timestamp = time.strftime("%H:%M:%S")
@@ -545,7 +747,7 @@ class TranslatorDialog(QDialog):
         self.update_cooldown_timer()
 
     def update_cooldown_timer(self):
-        if self.cooldown_remaining < 0:
+        if self.cooldown_remaining < 0 or (hasattr(self.worker, 'is_cancelled') and self.worker.is_cancelled):
             self.is_cooldown = False
             self.status_label.setText("Testuję połączenie...")
             return
@@ -561,9 +763,15 @@ class TranslatorDialog(QDialog):
     def toggle_controls(self, enabled):
         for control in self.controls_to_toggle:
             control.setEnabled(enabled)
-        if enabled and self.input_csv_path:
-            self.load_columns_button.setEnabled(True)
-        elif not enabled:
+        
+        self.start_button.setHidden(not enabled)
+        self.cancel_button.setHidden(enabled)
+
+        if enabled:
+            self.cancel_button.setEnabled(True)
+            if self.input_csv_path:
+                self.load_columns_button.setEnabled(True)
+        else:
             self.load_columns_button.setEnabled(False)
 
     def format_time(self, seconds):
@@ -572,3 +780,9 @@ class TranslatorDialog(QDialog):
         m = (seconds % 3600) // 60
         s = seconds % 60
         return f"{h:02d}:{m:02d}:{s:02d}" if h > 0 else f"{m:02d}:{s:02d}"
+    
+    def reject(self):
+        if hasattr(self, 'worker') and self.worker:
+            self.worker.is_cancelled = True
+        self.save_settings()
+        super().reject()

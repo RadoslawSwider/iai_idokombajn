@@ -59,7 +59,7 @@ def update_menu_descriptions(base_url: str, api_key: str, payload_list: list[dic
                 error_message += f"\nTreść odpowiedzi błędu: {e.response.text}"
             yield error_message
 
-def run_update_descriptions(base_url: str, api_key: str, source_shop_id: str, source_menu_id: str, dest_shop_id: str, dest_menu_id: str, dest_lang_id: str) -> Generator[str, None, None]:
+def run_update_descriptions(base_url: str, api_key: str, source_shop_id: str, source_menu_id: str, dest_shop_id: str, dest_menu_id: str, dest_lang_id: str, progress_callback=None) -> Generator[str, None, None]:
     """Główna funkcja orkiestrująca działanie."""
     SOURCE_LANG_ID = "pol"
 

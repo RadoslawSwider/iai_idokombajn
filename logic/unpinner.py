@@ -85,7 +85,7 @@ def run_update_process(url, headers, tasks):
             
     yield "Zakończono przetwarzanie wszystkich paczek."
 
-def run_unpinner(base_url, api_key, shop_id, menu_id):
+def run_unpinner(base_url, api_key, shop_id, menu_id, progress_callback=None):
     full_url = f"{base_url.rstrip('/')}/{ENDPOINT.lstrip('/')}"
     headers = {
         "accept": "application/json",

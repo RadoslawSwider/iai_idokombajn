@@ -1,4 +1,3 @@
-
 from PyQt6.QtWidgets import QDialog, QLineEdit, QFormLayout, QDialogButtonBox, QVBoxLayout, QLabel
 
 class NewModulesDialog(QDialog):
@@ -10,16 +9,29 @@ class NewModulesDialog(QDialog):
         self.source_menu_id_input = QLineEdit(self)
         self.dest_shop_id_input = QLineEdit(self)
         self.dest_menu_id_input = QLineEdit(self)
-        self.dest_lang_id_input = QLineEdit(self)
+        
+        self.is_sync_filters = "Synchronizuj filtry menu" in title
+
+        if self.is_sync_filters:
+            self.source_lang_id_input = QLineEdit(self)
+            self.dest_lang_id_input = QLineEdit(self)
+        else:
+            self.lang_id_input = QLineEdit(self)
 
         form_layout = QFormLayout()
         form_layout.addRow(QLabel("<b>Dane źródłowe:</b>"))
         form_layout.addRow("ID sklepu źródłowego:", self.source_shop_id_input)
         form_layout.addRow("ID menu źródłowego:", self.source_menu_id_input)
+        if self.is_sync_filters:
+            form_layout.addRow("Język źródłowy (np. pol):", self.source_lang_id_input)
+
         form_layout.addRow(QLabel("<b>Dane docelowe:</b>"))
         form_layout.addRow("ID sklepu docelowego:", self.dest_shop_id_input)
         form_layout.addRow("ID menu docelowego:", self.dest_menu_id_input)
-        form_layout.addRow("Język do aktualizacji (np. eng, cze):", self.dest_lang_id_input)
+        if self.is_sync_filters:
+            form_layout.addRow("Język docelowy (opcjonalny, np. cze):", self.dest_lang_id_input)
+        else:
+            form_layout.addRow("Język do aktualizacji (np. eng, cze):", self.lang_id_input)
 
         button_box = QDialogButtonBox(QDialogButtonBox.StandardButton.Ok | QDialogButtonBox.StandardButton.Cancel)
         button_box.accepted.connect(self.accept)
@@ -30,11 +42,21 @@ class NewModulesDialog(QDialog):
         layout.addWidget(button_box)
         self.setLayout(layout)
 
-    def get_data(self) -> tuple[str, str, str, str, str]:
-        return (
-            self.source_shop_id_input.text(),
-            self.source_menu_id_input.text(),
-            self.dest_shop_id_input.text(),
-            self.dest_menu_id_input.text(),
-            self.dest_lang_id_input.text()
-        )
+    def get_data(self):
+        if self.is_sync_filters:
+            return (
+                self.source_shop_id_input.text(),
+                self.source_menu_id_input.text(),
+                self.dest_shop_id_input.text(),
+                self.dest_menu_id_input.text(),
+                self.source_lang_id_input.text(),
+                self.dest_lang_id_input.text()
+            )
+        else:
+            return (
+                self.source_shop_id_input.text(),
+                self.source_menu_id_input.text(),
+                self.dest_shop_id_input.text(),
+                self.dest_menu_id_input.text(),
+                self.lang_id_input.text()
+            )

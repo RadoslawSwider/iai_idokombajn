@@ -1,7 +1,7 @@
 import csv
 import os
 
-def run_filter(input_filename, output_filename, shop_id_to_keep):
+def run_filter(input_filename, output_filename, shop_id_to_keep, progress_callback=None):
     yield f"Rozpoczynam filtrowanie pliku {input_filename}..."
     yield f"Pozostaną tylko wiersze z shopId = {shop_id_to_keep}."
 
@@ -28,11 +28,7 @@ def run_filter(input_filename, output_filename, shop_id_to_keep):
                 if processed_rows % 10000 == 0:
                     yield f"Przetworzono {processed_rows} wierszy..."
         
-        # Po pomyślnym zapisaniu pliku tymczasowego, zamień oryginalny plik
-        yield "Zapisywanie zmian..."
-        os.remove(input_filename)
-        os.rename(output_filename, input_filename)
-        yield f"Pomyślnie przefiltrowano plik. Zaktualizowano {input_filename}."
+        yield f"Pomyślnie przefiltrowano plik. Wynik zapisano w {output_filename}."
 
     except FileNotFoundError:
         yield f"Błąd: Plik '{input_filename}' nie został znaleziony."

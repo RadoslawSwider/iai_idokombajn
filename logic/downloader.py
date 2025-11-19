@@ -102,7 +102,7 @@ def save_to_csv(data, filename):
     except IOError as e:
         yield f"Błąd zapisu do pliku CSV: {e}"
 
-def run_downloader(base_url, api_key):
+def run_downloader(base_url, api_key, progress_callback=None):
     full_url = f"{base_url.rstrip('/')}/{ENDPOINT.lstrip('/')}"
     headers = {
         "accept": "application/json",

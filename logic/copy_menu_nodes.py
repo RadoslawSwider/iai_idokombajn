@@ -1,6 +1,7 @@
 
 import requests
 import math
+import time
 from collections import defaultdict
 from typing import Generator, Any
 
@@ -21,11 +22,12 @@ def get_source_menu(base_url: str, api_key: str, shop_id: int, menu_id: int, lan
     }
     
     try:
+        time.sleep(0.5) # Opóźnienie, aby uniknąć bana
         response = requests.get(menu_api_url, headers=headers, params=params)
         response.raise_for_status()
         data = response.json()
         if not data.get("result"):
-            raise RuntimeError("Odpowiedź API nie zawiera danych menu ('result' jest pusty).")
+            raise RuntimeError(f"Odpowiedź API nie zawiera danych menu ('result' jest pusty).\nURL: {response.request.url}")
         return data['result']
     except requests.exceptions.HTTPError as errh:
         raise RuntimeError(f"BŁĄD HTTP: {errh}\nURL: {response.request.url}\nTreść: {response.text}") from errh
@@ -56,6 +58,7 @@ def create_menu_items_batch(base_url: str, api_key: str, shop_id: int, menu_id: 
     full_payload = {"menu_list": menu_list_payload}
     
     try:
+        time.sleep(0.5) # Opóźnienie, aby uniknąć bana
         response = requests.post(menu_api_url, json=full_payload, headers=headers)
         response.raise_for_status()
         results = response.json().get('result', [])
@@ -76,7 +79,7 @@ def create_menu_items_batch(base_url: str, api_key: str, shop_id: int, menu_id: 
     except requests.exceptions.RequestException as e:
         raise RuntimeError(f"Błąd requesta podczas tworzenia paczki: {e}\nTreść: {e.response.text}") from e
 
-def run_copy_menu_nodes(base_url: str, api_key: str, source_shop_id: int, source_menu_id: int, dest_shop_id: int, dest_menu_id: int, lang_id: str) -> Generator[str, None, None]:
+def run_copy_menu_nodes(base_url: str, api_key: str, source_shop_id: int, source_menu_id: int, dest_shop_id: int, dest_menu_id: int, lang_id: str, progress_callback=None) -> Generator[str, None, None]:
     """Główna funkcja orkiestrująca proces replikacji z użyciem paczek."""
     yield f"Krok 1: Pobieranie menu ze sklepu źródłowego (shop_id: {source_shop_id}, menu_id: {source_menu_id}, lang: {lang_id})..."
     try:
