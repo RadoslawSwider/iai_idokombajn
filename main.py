@@ -477,10 +477,10 @@ class MainWindow(QMainWindow):
         self.worker.start()
 
     def run_downloader_task(self):
-        self._start_task(run_downloader, [], {{}})
+        self._start_task(run_downloader, [], {})
 
     def run_description_downloader_task(self):
-        self._start_task(run_description_downloader, [], {{}})
+        self._start_task(run_description_downloader, [], {})
 
     def run_id_based_downloader_task(self):
         dialog = IdBasedDownloaderDialog(self)
@@ -577,7 +577,7 @@ class MainWindow(QMainWindow):
 if __name__ == "__main__":
     app = QApplication(sys.argv)
     STYLESHEET = """
-        QMainWindow, QDialog { background-color: #2B2B2B; }
+        QMainWindow, QDialog { background-color: #2B2B2B; color: #F0F0F0; }
         QLabel { color: #F0F0F0; }
         QPushButton { background-color: #3C3F41; color: #F0F0F0; border: 1px solid #555555; padding: 4px; min-height: 18px; font-size: 11px; }
         QPushButton:hover { background-color: #4A90E2; border: 1px solid #4A90E2; }
@@ -587,6 +587,8 @@ if __name__ == "__main__":
         QTextEdit { background-color: #252526; color: #F0F0F0; border: 1px solid #555555; }
         QToolTip { background-color: #3C3F41; color: #F0F0F0; border: 1px solid #555555; }
         QFrame[frameShape="5"], QFrame[frameShape="4"] { color: #555555; }
+        QGroupBox { color: #F0F0F0; }
+        QCheckBox { color: #F0F0F0; }
     """
     app.setStyleSheet(STYLESHEET)
     window = MainWindow()
